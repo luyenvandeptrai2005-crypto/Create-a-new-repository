@@ -5,57 +5,43 @@ const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
 const cron = require('node-cron');
 const PQueue = require('p-queue').default;
+const express = require('express'); // THÊM EXPRESS CHO RENDER
 
-// ================= CONFIG =================
-
+// ================= CONFIG & INIT =================
 const CONFIG = {
     BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
     FB_COOKIE: process.env.FB_COOKIE,
-    FB_TOKEN: process.env.FB_TOKEN,
-    ADMIN_ID: Number(process.env.ADMIN_ID),
-
     CHECK_INTERVAL: 15000,
     RETRY_COUNT: 3
 };
 
-if (
-    !CONFIG.BOT_TOKEN ||
-    !CONFIG.FB_COOKIE ||
-    !CONFIG.FB_TOKEN
-) {
-    console.log('❌ THIẾU FILE .env');
-    process.exit();
+if (!CONFIG.BOT_TOKEN) {
+    console.error('❌ THIẾU TELEGRAM_BOT_TOKEN trong .env');
+    process.exit(1);
 }
 
-// ================= INIT =================
-
-const bot = new TelegramBot(CONFIG.BOT_TOKEN, {
-    polling: true
-});
-
-const db = new sqlite3.Database('./uid_monitor.db');
-
-const queue = new PQueue({
-    interval: CONFIG.CHECK_INTERVAL,
-    intervalCap: 1
-});
+const bot = new TelegramBot(CONFIG.BOT_TOKEN, { polling: true });
+const db = new sqlite3.Database('./uid_pro_monitor.db');
+const queue = new PQueue({ interval: CONFIG.CHECK_INTERVAL, intervalCap: 1 });
+const sessions = {}; 
 
 const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-    'Mozilla/5.0 (Linux; Android 13)',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
 ];
 
-// ================= DATABASE =================
-
+// ================= DATABASE SETUP =================
 db.serialize(() => {
-
     db.run(`
         CREATE TABLE IF NOT EXISTS accounts (
             uid TEXT PRIMARY KEY,
             chat_id TEXT,
+            name TEXT DEFAULT 'Không tên',
+            note TEXT DEFAULT '🦦',
             status TEXT DEFAULT 'LIVE',
+            die_type TEXT DEFAULT '',
+            is_tracking INTEGER DEFAULT 1,
             fail_count INTEGER DEFAULT 0,
             created_at TEXT,
             last_check TEXT,
@@ -63,553 +49,225 @@ db.serialize(() => {
             live_back_time TEXT
         )
     `);
-
-    db.run(`
-        CREATE TABLE IF NOT EXISTS users (
-            chat_id TEXT PRIMARY KEY,
-            joined_at TEXT
-        )
-    `);
 });
 
-// ================= FUNCTIONS =================
+// ================= HELPER FUNCTIONS =================
+const getRandomUA = () => USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+const formatTime = () => new Date().toLocaleString('vi-VN');
+const extractUID = (input) => {
+    const match = input.trim().match(/(\d{5,20})/);
+    return match ? match[1] : null;
+};
 
-function getRandomUA() {
-    return USER_AGENTS[
-        Math.floor(Math.random() * USER_AGENTS.length)
-    ];
-}
+const detectDieType = (url, html) => {
+    if (!url) return null;
+    const checkpointMatch = url.match(/checkpoint\/(\d+)/);
+    if (checkpointMatch) {
+        const id = checkpointMatch[1];
+        if (id.endsWith('282')) return '282';
+        if (id.endsWith('956')) return '956';
+        return id; 
+    }
+    const helpMatch = url.match(/help\/(?:contact\/)?(\d+)/);
+    if (helpMatch) {
+        const id = helpMatch[1];
+        if (id.endsWith('583')) return '583';
+        return id;
+    }
+    if (url.includes('/recover/')) return 'Recover';
+    if (url.includes('/login/') && html.includes('tài khoản của bạn đã bị vô hiệu hóa')) return 'Disabled';
+    return 'Không xác định';
+};
 
-function getTrackingDays(createdAt) {
-
-    const start = new Date(createdAt);
-    const now = new Date();
-
-    const diff = now - start;
-
-    return Math.floor(diff / (1000 * 60 * 60 * 24));
-}
-
-function formatTime() {
-
-    return new Date().toLocaleString('vi-VN');
-}
-
-function extractUID(input) {
-
-    const text = input.trim();
-
-    if (/^\d+$/.test(text)) return text;
-
-    const match = text.match(/(\d{5,20})/);
-
-    if (match) return match[1];
-
-    return text;
-}
-
-// ================= SMART CHECK =================
-
+// ================= CORE CHECKER =================
 async function smartCheck(uid) {
+    try {
+        const res = await axios.get(`https://mbasic.facebook.com/${uid}`, {
+            headers: {
+                'cookie': CONFIG.FB_COOKIE || '',
+                'user-agent': getRandomUA(),
+                'accept-language': 'vi-VN,vi;q=0.9'
+            },
+            timeout: 10000,
+            maxRedirects: 0,
+            validateStatus: () => true
+        });
 
-    let liveScore = 0;
-    let dieScore = 0;
+        const location = res.headers.location || '';
+        const html = String(res.data).toLowerCase();
 
-    for (let retry = 0; retry < CONFIG.RETRY_COUNT; retry++) {
-
-        try {
-
-            // ===== GRAPH API =====
-
-            try {
-
-                const api = await axios.get(
-                    `https://graph.facebook.com/${uid}`,
-                    {
-                        params: {
-                            access_token: CONFIG.FB_TOKEN,
-                            fields: 'id,name'
-                        },
-                        timeout: 8000
-                    }
-                );
-
-                if (api.data?.id) {
-                    liveScore += 2;
-                }
-
-            } catch (e) {
-
-                const code = e.response?.data?.error?.code;
-
-                if (code === 803 || code === 100) {
-                    dieScore += 2;
-                }
-            }
-
-            // ===== MBASIC =====
-
-            const res = await axios.get(
-                `https://mbasic.facebook.com/${uid}`,
-                {
-                    headers: {
-                        cookie: CONFIG.FB_COOKIE,
-                        'user-agent': getRandomUA(),
-                        'accept-language': 'vi-VN,vi;q=0.9'
-                    },
-                    timeout: 12000,
-                    maxRedirects: 0,
-                    validateStatus: () => true
-                }
-            );
-
-            const location = res.headers.location || '';
-
-            // ===== COOKIE DIE =====
-
-            if (
-                location.includes('checkpoint') ||
-                location.includes('login') ||
-                location.includes('recover')
-            ) {
-
-                return {
-                    status: 'COOKIE_DIE'
-                };
-            }
-
-            const html = String(res.data).toLowerCase();
-
-            // ===== RATE LIMIT =====
-
-            const limitKeywords = [
-                'temporarily blocked',
-                'rate limit',
-                'action blocked',
-                'slow down'
-            ];
-
-            if (limitKeywords.some(v => html.includes(v))) {
-
-                await new Promise(r =>
-                    setTimeout(r, 5000)
-                );
-
-                continue;
-            }
-
-            // ===== DIE KEYWORDS =====
-
-            const dieKeywords = [
-                "this content isn't available",
-                'nội dung này hiện không khả dụng',
-                'không tìm thấy nội dung',
-                'this page is not available',
-                'liên kết bạn đã theo dõi có thể bị hỏng'
-            ];
-
-            if (dieKeywords.some(v => html.includes(v))) {
-                dieScore += 3;
-            } else {
-                liveScore += 2;
-            }
-
-            // ===== LIVE KEYWORDS =====
-
-            const liveKeywords = [
-                'timeline',
-                'cover photo',
-                'profile.php',
-                'message',
-                'add friend'
-            ];
-
-            if (liveKeywords.some(v => html.includes(v))) {
-                liveScore += 3;
-            }
-
-            // ===== RESULT =====
-
-            if (dieScore >= 4 && dieScore > liveScore) {
-
-                return {
-                    status: 'DIE'
-                };
-            }
-
-            return {
-                status: 'LIVE'
-            };
-
-        } catch (e) {
-
-            if (retry === CONFIG.RETRY_COUNT - 1) {
-
-                return {
-                    status: 'ERROR'
-                };
-            }
-
-            await new Promise(r =>
-                setTimeout(r, 4000)
-            );
+        if (location.includes('login.php') && !html.includes('profile')) return { status: 'COOKIE_DIE' };
+        if (location.includes('checkpoint') || location.includes('help') || location.includes('recover')) {
+            const dieType = detectDieType(location, html);
+            return { status: 'DIE', dieType: dieType || 'Checkpoint' };
         }
+        const dieKeywords = ["this content isn't available", "nội dung này hiện không khả dụng", "không tìm thấy nội dung"];
+        if (dieKeywords.some(v => html.includes(v)) || res.status === 404) return { status: 'DIE', dieType: 'Not Found / 404' };
+
+        return { status: 'LIVE' };
+    } catch (e) {
+        return { status: 'ERROR', error: e.message };
     }
 }
 
-// ================= START =================
-
+// ================= BOT HANDLERS =================
 bot.onText(/\/start/, (msg) => {
-
-    db.run(
-        `INSERT OR IGNORE INTO users VALUES (?, ?)`,
-        [
-            msg.chat.id,
-            new Date().toISOString()
-        ]
-    );
-
-    bot.sendMessage(
-        msg.chat.id,
-`🔥 FACEBOOK UID MONITOR BOT
-
-✅ Theo dõi LIVE/DIE realtime
-✅ Chống báo ảo
-✅ Detect LIVE trở lại
-✅ Theo dõi số ngày
-
-📥 Gửi UID hoặc link Facebook để theo dõi.`
-    );
+    bot.sendMessage(msg.chat.id, `🚀 *HỆ THỐNG MONITOR UID PRO*\n\nGõ /check để bắt đầu kiểm tra và thêm UID vào danh sách theo dõi.`, {parse_mode: 'Markdown'});
 });
 
-// ================= ADD UID =================
+bot.onText(/\/check/, (msg) => {
+    const chatId = msg.chat.id;
+    sessions[chatId] = { state: 'AWAITING_UID' };
+    bot.sendMessage(chatId, '📬 Vui lòng nhập UID Hoặc URL:', { reply_markup: { force_reply: true } });
+});
 
 bot.on('message', async (msg) => {
+    if (!msg.text || msg.text.startsWith('/')) return;
+    const chatId = msg.chat.id;
+    const session = sessions[chatId];
 
-    if (!msg.text) return;
+    if (session && session.state === 'AWAITING_UID') {
+        const uid = extractUID(msg.text);
+        if (!uid) return bot.sendMessage(chatId, '❌ Lỗi: Không tìm thấy UID hợp lệ!');
 
-    if (msg.text.startsWith('/')) return;
-
-    const uid = extractUID(msg.text);
-
-    db.get(
-        `SELECT * FROM accounts WHERE uid=?`,
-        [uid],
-        (err, row) => {
-
-            if (row) {
-
-                bot.sendMessage(
-                    msg.chat.id,
-                    '⚠️ UID đã tồn tại.'
-                );
-
-                return;
-            }
-
-            db.run(
-                `INSERT INTO accounts (
-                    uid,
-                    chat_id,
-                    status,
-                    created_at,
-                    last_check
-                ) VALUES (?, ?, 'LIVE', ?, ?)`,
-                [
-                    uid,
-                    msg.chat.id,
-                    new Date().toISOString(),
-                    new Date().toISOString()
-                ]
-            );
-
-            bot.sendMessage(
-                msg.chat.id,
-`✅ ĐÃ THÊM UID
-
-🆔 UID: ${uid}
-🕒 Bắt đầu: ${formatTime()}
-🔥 Trạng thái: MONITORING`,
-                {
-                    reply_markup: {
-                        inline_keyboard: [
-                            [
-                                {
-                                    text: '🔄 Check ngay',
-                                    callback_data: `check_${uid}`
-                                }
-                            ],
-                            [
-                                {
-                                    text: '❌ Xóa UID',
-                                    callback_data: `delete_${uid}`
-                                }
-                            ]
-                        ]
-                    }
-                }
-            );
-        }
-    );
-});
-
-// ================= CALLBACK =================
-
-bot.on('callback_query', async (query) => {
-
-    const data = query.data;
-    const chatId = query.message.chat.id;
-
-    // ===== CHECK NOW =====
-
-    if (data.startsWith('check_')) {
-
-        const uid = data.replace('check_', '');
-
-        bot.sendMessage(chatId, '⏳ ĐANG KIỂM TRA...');
-
+        bot.sendMessage(chatId, `⏳ Đang kiểm tra UID: ${uid}...`);
         const result = await smartCheck(uid);
 
         if (result.status === 'LIVE') {
-
-            bot.sendMessage(
-                chatId,
-`🟢 UID LIVE
-
-🆔 UID: ${uid}
-🕒 ${formatTime()}
-🔥 Tài khoản đang hoạt động`
-            );
-
+            bot.sendMessage(chatId, `✅ UID ${uid} đang LIVE.\n📌 Nhập Tên/Ghi chú để lưu vào danh sách:`);
+            sessions[chatId] = { state: 'AWAITING_ACC_NAME', tempUid: uid };
         } else if (result.status === 'DIE') {
-
-            bot.sendMessage(
-                chatId,
-`❌ UID DIE
-
-🆔 UID: ${uid}
-🕒 ${formatTime()}`
-            );
-
+            sessions[chatId] = { state: 'AWAITING_SAVE_DECISION', tempUid: uid };
+            bot.sendMessage(chatId, `❌ UID ${uid} đã DIE.\n⚠️ Die Dạng: ${result.dieType}\n\n📌 Bạn có muốn lưu UID này không?`, {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '✅ Lưu UID', callback_data: `save_uid_${uid}` }, { text: '❌ Bỏ qua', callback_data: `ignore_uid` }]
+                    ]
+                }
+            });
         } else {
-
-            bot.sendMessage(
-                chatId,
-                '⚠️ COOKIE FACEBOOK DIE'
-            );
+            bot.sendMessage(chatId, `⚠️ Hệ thống kiểm tra đang lỗi hoặc Cookie cấu hình bị die.`);
+            delete sessions[chatId];
         }
-    }
-
-    // ===== DELETE =====
-
-    if (data.startsWith('delete_')) {
-
-        const uid = data.replace('delete_', '');
-
+    } 
+    else if (session && session.state === 'AWAITING_ACC_NAME') {
+        const uid = session.tempUid;
+        const accName = msg.text;
+        
         db.run(
-            `DELETE FROM accounts WHERE uid=?`,
-            [uid]
-        );
-
-        bot.sendMessage(
-            chatId,
-            `🗑 ĐÃ XÓA UID ${uid}`
+            `INSERT OR REPLACE INTO accounts (uid, chat_id, name, created_at, last_check) VALUES (?, ?, ?, ?, ?)`,
+            [uid, chatId, accName, new Date().toISOString(), new Date().toISOString()],
+            (err) => {
+                if (!err) bot.sendMessage(chatId, `✅ Đã lưu UID: ${uid} (${accName}) vào danh sách theo dõi.`);
+                delete sessions[chatId];
+            }
         );
     }
 });
 
-// ================= AUTO CHECK =================
+bot.on('callback_query', async (query) => {
+    const data = query.data;
+    const chatId = query.message.chat.id;
+    const messageId = query.message.message_id;
+
+    if (data.startsWith('save_uid_')) {
+        const uid = data.replace('save_uid_', '');
+        sessions[chatId] = { state: 'AWAITING_ACC_NAME', tempUid: uid };
+        bot.sendMessage(chatId, '📝 Vui lòng nhập Tên Tài Khoản hoặc Ghi chú cho UID này:', { reply_markup: { force_reply: true } });
+        bot.answerCallbackQuery(query.id);
+    } 
+    else if (data === 'ignore_uid') {
+        delete sessions[chatId];
+        bot.deleteMessage(chatId, messageId);
+        bot.answerCallbackQuery(query.id, { text: 'Đã bỏ qua.' });
+    }
+    else if (data.startsWith('pause_')) {
+        const uid = data.replace('pause_', '');
+        db.run(`UPDATE accounts SET is_tracking = 0 WHERE uid = ?`, [uid]);
+        bot.answerCallbackQuery(query.id, { text: '🛑 Đã dừng theo dõi' });
+        bot.editMessageReplyMarkup({
+            inline_keyboard: [
+                [{ text: '🔄 Tiếp tục theo dõi', callback_data: `resume_${uid}` }, { text: '❌ Xóa UID', callback_data: `delete_${uid}` }]
+            ]
+        }, { chat_id: chatId, message_id: messageId });
+    }
+    else if (data.startsWith('resume_')) {
+        const uid = data.replace('resume_', '');
+        db.run(`UPDATE accounts SET is_tracking = 1 WHERE uid = ?`, [uid]);
+        bot.answerCallbackQuery(query.id, { text: '▶️ Đã tiếp tục theo dõi' });
+        bot.editMessageReplyMarkup({
+            inline_keyboard: [
+                [{ text: '🔄 Check lại', callback_data: `recheck_${uid}` }, { text: '🛑 Dừng theo dõi', callback_data: `pause_${uid}` }],
+                [{ text: '❌ Xóa UID', callback_data: `delete_${uid}` }]
+            ]
+        }, { chat_id: chatId, message_id: messageId });
+    }
+    else if (data.startsWith('delete_')) {
+        const uid = data.replace('delete_', '');
+        db.run(`DELETE FROM accounts WHERE uid=?`, [uid]);
+        bot.answerCallbackQuery(query.id, { text: `🗑 Đã xóa UID ${uid}` });
+        bot.deleteMessage(chatId, messageId);
+    }
+    else if (data.startsWith('recheck_')) {
+        const uid = data.replace('recheck_', '');
+        bot.answerCallbackQuery(query.id, { text: '⏳ Đang kiểm tra...' });
+        const result = await smartCheck(uid);
+        bot.sendMessage(chatId, `Trạng thái hiện tại của UID ${uid}: ${result.status}`);
+    }
+});
 
 cron.schedule('*/1 * * * *', async () => {
+    db.all(`SELECT * FROM accounts WHERE is_tracking = 1`, async (err, rows) => {
+        if (!rows || rows.length === 0) return;
+        for (const row of rows) {
+            await queue.add(async () => {
+                const result = await smartCheck(row.uid);
+                if (result.status === 'ERROR' || result.status === 'COOKIE_DIE') return; 
 
-    db.all(
-        `SELECT * FROM accounts`,
-        async (err, rows) => {
-
-            if (!rows) return;
-
-            for (const row of rows) {
-
-                await queue.add(async () => {
-
-                    const result = await smartCheck(row.uid);
-
-                    // ===== COOKIE DIE =====
-
-                    if (result.status === 'COOKIE_DIE') {
-
-                        bot.sendMessage(
-                            row.chat_id,
-                            '⚠️ COOKIE FACEBOOK ĐÃ DIE'
-                        );
-
-                        return;
-                    }
-
-                    // ===== ERROR =====
-
-                    if (result.status === 'ERROR') {
-                        return;
-                    }
-
-                    // ===== UID DIE =====
-
-                    if (
-                        result.status === 'DIE' &&
-                        row.status === 'LIVE'
-                    ) {
-
-                        const failCount =
-                            row.fail_count + 1;
-
-                        // anti báo ảo
-
-                        if (failCount >= 3) {
-
-                            const trackingDays =
-                                getTrackingDays(
-                                    row.created_at
-                                );
-
-                            bot.sendMessage(
-                                row.chat_id,
-`❌ UID ĐÃ DIE
-
-🆔 UID: ${row.uid}
-📅 Theo dõi: ${trackingDays} ngày
-🕒 DIE lúc: ${formatTime()}
-🔥 Trạng thái: DIE`,
-                                {
-                                    reply_markup: {
-                                        inline_keyboard: [
-                                            [
-                                                {
-                                                    text: '🔄 Theo dõi tiếp',
-                                                    callback_data:
-                                                        `check_${row.uid}`
-                                                }
-                                            ],
-                                            [
-                                                {
-                                                    text: '❌ Xóa UID',
-                                                    callback_data:
-                                                        `delete_${row.uid}`
-                                                }
-                                            ]
-                                        ]
-                                    }
-                                }
-                            );
-
-                            db.run(
-                                `UPDATE accounts
-                                 SET status='DIE',
-                                 fail_count=0,
-                                 die_time=?,
-                                 last_check=?
-                                 WHERE uid=?`,
-                                [
-                                    new Date().toISOString(),
-                                    new Date().toISOString(),
-                                    row.uid
+                if (result.status === 'DIE' && row.status === 'LIVE') {
+                    const failCount = row.fail_count + 1;
+                    if (failCount >= 3) {
+                        const msgText = `🍂 ${row.uid} đã DIE ❌\n👤 Tài Khoản: ${row.name}\n📝 Ghi Chú: ${row.note}\n⚠️ Die Dạng: ${result.dieType}\n⏰ Thời Gian: ${formatTime()}`;
+                        bot.sendMessage(row.chat_id, msgText, {
+                            reply_markup: {
+                                inline_keyboard: [
+                                    [{ text: '🔄 Tiếp tục theo dõi', callback_data: `resume_${row.uid}` }, { text: '🛑 Dừng theo dõi', callback_data: `pause_${row.uid}` }],
+                                    [{ text: '❌ Xóa UID', callback_data: `delete_${row.uid}` }]
                                 ]
-                            );
-
-                        } else {
-
-                            db.run(
-                                `UPDATE accounts
-                                 SET fail_count=?
-                                 WHERE uid=?`,
-                                [
-                                    failCount,
-                                    row.uid
-                                ]
-                            );
-                        }
-
-                        return;
-                    }
-
-                    // ===== UID LIVE LẠI =====
-
-                    if (
-                        result.status === 'LIVE' &&
-                        row.status === 'DIE'
-                    ) {
-
-                        const trackingDays =
-                            getTrackingDays(
-                                row.created_at
-                            );
-
-                        bot.sendMessage(
-                            row.chat_id,
-`🟢 UID LIVE TRỞ LẠI
-
-🆔 UID: ${row.uid}
-📅 Theo dõi: ${trackingDays} ngày
-🕒 LIVE lúc: ${formatTime()}
-🔥 Tài khoản đã hoạt động lại`,
-                            {
-                                reply_markup: {
-                                    inline_keyboard: [
-                                        [
-                                            {
-                                                text: '🔄 Check ngay',
-                                                callback_data:
-                                                    `check_${row.uid}`
-                                            }
-                                        ],
-                                        [
-                                            {
-                                                text: '❌ Xóa UID',
-                                                callback_data:
-                                                    `delete_${row.uid}`
-                                            }
-                                        ]
-                                    ]
-                                }
                             }
-                        );
-
-                        db.run(
-                            `UPDATE accounts
-                             SET status='LIVE',
-                             fail_count=0,
-                             live_back_time=?,
-                             last_check=?
-                             WHERE uid=?`,
-                            [
-                                new Date().toISOString(),
-                                new Date().toISOString(),
-                                row.uid
-                            ]
-                        );
-
-                        return;
+                        });
+                        db.run(`UPDATE accounts SET status='DIE', fail_count=0, die_type=?, die_time=?, last_check=? WHERE uid=?`, 
+                            [result.dieType, new Date().toISOString(), new Date().toISOString(), row.uid]);
+                    } else {
+                        db.run(`UPDATE accounts SET fail_count=? WHERE uid=?`, [failCount, row.uid]);
                     }
-
-                    // ===== UPDATE LIVE =====
-
-                    if (result.status === 'LIVE') {
-
-                        db.run(
-                            `UPDATE accounts
-                             SET status='LIVE',
-                             fail_count=0,
-                             last_check=?
-                             WHERE uid=?`,
-                            [
-                                new Date().toISOString(),
-                                row.uid
-                            ]
-                        );
-                    }
-                });
-            }
+                } 
+                else if (result.status === 'LIVE' && row.status === 'DIE') {
+                    const msgText = `🌱 ${row.uid} ĐÃ SỐNG LẠI (LIVE) ✅\n👤 Tài Khoản: ${row.name}\n⏰ Thời Gian: ${formatTime()}`;
+                    bot.sendMessage(row.chat_id, msgText, { reply_markup: { inline_keyboard: [[{ text: '❌ Xóa UID', callback_data: `delete_${row.uid}` }]] } });
+                    db.run(`UPDATE accounts SET status='LIVE', fail_count=0, die_type='', live_back_time=?, last_check=? WHERE uid=?`, 
+                        [new Date().toISOString(), new Date().toISOString(), row.uid]);
+                } 
+                else if (result.status === 'LIVE') {
+                    db.run(`UPDATE accounts SET fail_count=0, last_check=? WHERE uid=?`, [new Date().toISOString(), row.uid]);
+                }
+            });
         }
-    );
+    });
 });
 
-console.log('🔥 UID MONITOR BOT ONLINE');
+// ================= RENDER WEB SERVER =================
+// Web Server ảo để Render không báo lỗi "Port bind timeout"
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+    res.send('🟢 Bot Telegram Monitor UID đang hoạt động mượt mà!');
+});
+
+app.listen(PORT, () => {
+    console.log(`🌍 Web Server đang chạy trên port ${PORT} (Pass Render Health Check)`);
+    console.log('🚀 SYSTEM READY: Tối ưu chuẩn PRO 98%');
+});const app = express();
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => { ... });
