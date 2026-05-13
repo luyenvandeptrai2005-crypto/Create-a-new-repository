@@ -18,7 +18,6 @@ const CONFIG = {
 const bot = new TelegramBot(CONFIG.BOT_TOKEN, { polling: true });
 
 // ================= CÀI ĐẶT MENU TELEGRAM =================
-// Hàm này sẽ tạo nút "Menu" màu xanh ở góc trái ô nhập tin nhắn Telegram
 bot.setMyCommands([
     { command: 'addacc', description: 'Thêm và theo dõi UID mới' },
     { command: 'check', description: 'Kiểm tra trạng thái UID' },
@@ -179,8 +178,12 @@ const sendHelpMenu = (chatId) => {
 bot.onText(/\/start|\/help|\/menu/, (msg) => sendHelpMenu(msg.chat.id));
 
 // ================= ADD ACCOUNT =================
-bot.onText(/\/addacc (.+)/, async (msg, match) => {
+bot.onText(/\/addacc(?:\s+(.+))?/, async (msg, match) => {
     const chatId = msg.chat.id;
+    if (!match[1]) {
+        return safeSend(chatId, '📝 *Vui lòng nhập thêm thông số*\nCopy lệnh bên dưới và điền thông tin của bạn:\n`/addacc UID | Tên | Note`\n\n💡 *Ví dụ:* `/addacc 100012345678 | Nick Chính | Acc MMO`');
+    }
+
     const parts = match[1].split('|').map(v => v.trim());
     const uid = extractUID(parts[0]);
     const name = parts[1] || 'Chưa đặt tên';
@@ -215,56 +218,81 @@ bot.onText(/\/listacc/, (msg) => {
 });
 
 // ================= CHECK =================
-bot.onText(/\/check (.+)/, async (msg, match) => {
-    const uid = extractUID(match[1]);
-    if (!uid) return safeSend(msg.chat.id, '❌ UID không hợp lệ.');
+bot.onText(/\/check(?:\s+(.+))?/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    if (!match[1]) {
+        return safeSend(chatId, '📝 *Vui lòng nhập thêm UID cần check*\nCú pháp: `/check UID`\n💡 *Ví dụ:* `/check 100012345678`');
+    }
 
-    safeSend(msg.chat.id, `🔎 Đang kiểm tra realtime: \`${uid}\``);
+    const uid = extractUID(match[1]);
+    if (!uid) return safeSend(chatId, '❌ UID không hợp lệ.');
+
+    safeSend(chatId, `🔎 Đang kiểm tra realtime: \`${uid}\``);
     const res = await smartCheck(uid);
     let resultText = res.status === 'LIVE' ? '✅ LIVE' : (res.status === 'DIE' ? `❌ DIE (${res.dieType})` : '⚠️ ERROR');
     
-    safeSend(msg.chat.id, `📊 *KẾT QUẢ CHECK*\n🆔 UID: \`${uid}\`\n🌿 Trạng thái: ${resultText}\n⏰ ${formatTime()}`);
+    safeSend(chatId, `📊 *KẾT QUẢ CHECK*\n🆔 UID: \`${uid}\`\n🌿 Trạng thái: ${resultText}\n⏰ ${formatTime()}`);
 });
 
 // ================= DELETE =================
-bot.onText(/\/delacc (.+)/, (msg, match) => {
+bot.onText(/\/delacc(?:\s+(.+))?/, (msg, match) => {
+    const chatId = msg.chat.id;
+    if (!match[1]) {
+        return safeSend(chatId, '📝 *Vui lòng nhập UID cần xóa*\nCú pháp: `/delacc UID`');
+    }
+
     const uid = extractUID(match[1]);
     db.run(`DELETE FROM accounts WHERE uid = ?`, [uid], function(err) {
-        if (this.changes > 0) safeSend(msg.chat.id, `🗑 Đã xóa UID: \`${uid}\``);
-        else safeSend(msg.chat.id, '❌ UID không tồn tại.');
+        if (this.changes > 0) safeSend(chatId, `🗑 Đã xóa UID: \`${uid}\``);
+        else safeSend(chatId, '❌ UID không tồn tại.');
     });
 });
 
 // ================= SET NOTE =================
-bot.onText(/\/setnote (.+)/, (msg, match) => {
+bot.onText(/\/setnote(?:\s+(.+))?/, (msg, match) => {
+    const chatId = msg.chat.id;
+    if (!match[1]) {
+        return safeSend(chatId, '📝 *Vui lòng nhập cú pháp*\n`/setnote UID | Note mới`');
+    }
+
     const parts = match[1].split('|').map(v => v.trim());
-    if (parts.length < 2) return safeSend(msg.chat.id, '❌ Dùng lệnh: /setnote UID | Note mới');
+    if (parts.length < 2) return safeSend(chatId, '❌ Thiếu dấu `|`. Dùng lệnh:\n`/setnote UID | Note mới`');
     
     const uid = extractUID(parts[0]);
     db.run(`UPDATE accounts SET note = ? WHERE uid = ?`, [parts[1], uid], function(err) {
-        if (this.changes > 0) safeSend(msg.chat.id, `✅ Đã cập nhật note\n🆔 \`${uid}\`\n📝 ${parts[1]}`);
-        else safeSend(msg.chat.id, '❌ Không tìm thấy UID.');
+        if (this.changes > 0) safeSend(chatId, `✅ Đã cập nhật note\n🆔 \`${uid}\`\n📝 ${parts[1]}`);
+        else safeSend(chatId, '❌ Không tìm thấy UID.');
     });
 });
 
 // ================= SET NAME =================
-bot.onText(/\/setname (.+)/, (msg, match) => {
+bot.onText(/\/setname(?:\s+(.+))?/, (msg, match) => {
+    const chatId = msg.chat.id;
+    if (!match[1]) {
+        return safeSend(chatId, '📝 *Vui lòng nhập cú pháp*\n`/setname UID | Tên mới`');
+    }
+
     const parts = match[1].split('|').map(v => v.trim());
-    if (parts.length < 2) return safeSend(msg.chat.id, '❌ Dùng lệnh: /setname UID | Tên mới');
+    if (parts.length < 2) return safeSend(chatId, '❌ Thiếu dấu `|`. Dùng lệnh:\n`/setname UID | Tên mới`');
 
     const uid = extractUID(parts[0]);
     db.run(`UPDATE accounts SET name = ? WHERE uid = ?`, [parts[1], uid], function(err) {
-        if (this.changes > 0) safeSend(msg.chat.id, `✅ Đã cập nhật tên\n🆔 \`${uid}\`\n👤 ${parts[1]}`);
-        else safeSend(msg.chat.id, '❌ Không tìm thấy UID.');
+        if (this.changes > 0) safeSend(chatId, `✅ Đã cập nhật tên\n🆔 \`${uid}\`\n👤 ${parts[1]}`);
+        else safeSend(chatId, '❌ Không tìm thấy UID.');
     });
 });
 
 // ================= INFO =================
-bot.onText(/\/info (.+)/, (msg, match) => {
+bot.onText(/\/info(?:\s+(.+))?/, (msg, match) => {
+    const chatId = msg.chat.id;
+    if (!match[1]) {
+        return safeSend(chatId, '📝 *Vui lòng nhập UID cần xem*\nCú pháp: `/info UID`');
+    }
+
     const uid = extractUID(match[1]);
     db.get(`SELECT * FROM accounts WHERE uid = ?`, [uid], async (err, row) => {
-        if (!row) return safeSend(msg.chat.id, '❌ Không tìm thấy UID.');
-        safeSend(msg.chat.id, `📊 *THÔNG TIN UID*\n🆔 UID: \`${row.uid}\`\n👤 Tên: ${row.name}\n📝 Note: ${row.note}\n🌿 Trạng thái: ${statusIcon(row.status)} ${row.status}\n⚠️ Dạng DIE: ${row.die_type || 'Không'}\n📅 Theo dõi: ${row.start_date}\n⏱ Check cuối: ${row.last_check}\n🔄 Đổi trạng thái: ${row.last_change}`);
+        if (!row) return safeSend(chatId, '❌ Không tìm thấy UID.');
+        safeSend(chatId, `📊 *THÔNG TIN UID*\n🆔 UID: \`${row.uid}\`\n👤 Tên: ${row.name}\n📝 Note: ${row.note}\n🌿 Trạng thái: ${statusIcon(row.status)} ${row.status}\n⚠️ Dạng DIE: ${row.die_type || 'Không'}\n📅 Theo dõi: ${row.start_date}\n⏱ Check cuối: ${row.last_check}\n🔄 Đổi trạng thái: ${row.last_change}`);
     });
 });
 
