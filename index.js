@@ -16,7 +16,7 @@ const CONFIG = {
 };
 
 if (!CONFIG.BOT_TOKEN) {
-    console.error('❌ THIẾU TELEGRAM_BOT_TOKEN trong .env hoặc biến môi trường');
+    console.error('❌ THIẾU TELEGRAM_BOT_TOKEN trong .env');
     process.exit(1);
 }
 
@@ -37,7 +37,7 @@ db.serialize(() => {
         CREATE TABLE IF NOT EXISTS accounts (
             uid TEXT PRIMARY KEY,
             chat_id TEXT,
-            name TEXT DEFAULT 'Không tên',
+            name TEXT DEFAULT 'chưa cập nhật',
             note TEXT DEFAULT '🦦',
             status TEXT DEFAULT 'LIVE',
             die_type TEXT DEFAULT '',
@@ -53,7 +53,10 @@ db.serialize(() => {
 
 // ================= HELPER FUNCTIONS =================
 const getRandomUA = () => USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-const formatTime = () => new Date().toLocaleString('vi-VN');
+const formatTime = () => {
+    const d = new Date();
+    return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')} ${d.getDate().toString().padStart(2, '0')}/${(d.getMonth() + 1).toString().padStart(2, '0')}/${d.getFullYear()}`;
+};
 const extractUID = (input) => {
     const match = input.trim().match(/(\d{5,20})/);
     return match ? match[1] : null;
@@ -110,9 +113,28 @@ async function smartCheck(uid) {
     }
 }
 
-// ================= BOT HANDLERS =================
+// ================= BOT COMMANDS =================
+bot.setMyCommands([
+    { command: '/start', description: 'Mở Menu hệ thống' },
+    { command: '/check', description: 'Check Live/Die UID' },
+    { command: '/list', description: 'Xem danh sách UID đang theo dõi' }
+]);
+
 bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, `🚀 *HỆ THỐNG MONITOR UID PRO*\n\nGõ /check để bắt đầu kiểm tra và thêm UID vào danh sách theo dõi.`, {parse_mode: 'Markdown'});
+    bot.sendMessage(msg.chat.id, `🚀 *HỆ THỐNG MONITOR UID PRO*\n\nGõ /check để bắt đầu kiểm tra.\nGõ /list để xem danh sách UID.`, {parse_mode: 'Markdown'});
+});
+
+bot.onText(/\/list/, (msg) => {
+    db.all(`SELECT * FROM accounts`, (err, rows) => {
+        if (!rows || rows.length === 0) return bot.sendMessage(msg.chat.id, '📭 Danh sách trống.');
+        let text = '📋 *DANH SÁCH UID ĐANG THEO DÕI*\n\n';
+        rows.forEach(r => {
+            const status = r.status === 'LIVE' ? '🟢 LIVE' : '🔴 DIE';
+            const tracking = r.is_tracking ? '' : '(Đang dừng)';
+            text += `• \`${r.uid}\` | ${r.name} | ${status} ${tracking}\n`;
+        });
+        bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+    });
 });
 
 bot.onText(/\/check/, (msg) => {
@@ -130,23 +152,23 @@ bot.on('message', async (msg) => {
         const uid = extractUID(msg.text);
         if (!uid) return bot.sendMessage(chatId, '❌ Lỗi: Không tìm thấy UID hợp lệ!');
 
-        bot.sendMessage(chatId, `⏳ Đang kiểm tra UID: ${uid}...`);
         const result = await smartCheck(uid);
 
         if (result.status === 'LIVE') {
-            bot.sendMessage(chatId, `✅ UID ${uid} đang LIVE.\n📌 Nhập Tên/Ghi chú để lưu vào danh sách:`);
+            bot.sendMessage(chatId, `✅ UID của bạn là: ${uid} (Đang LIVE)\n📌 Nhập Tên/Ghi chú để lưu vào danh sách:`);
             sessions[chatId] = { state: 'AWAITING_ACC_NAME', tempUid: uid };
         } else if (result.status === 'DIE') {
             sessions[chatId] = { state: 'AWAITING_SAVE_DECISION', tempUid: uid };
-            bot.sendMessage(chatId, `❌ UID ${uid} đã DIE.\n⚠️ Die Dạng: ${result.dieType}\n\n📌 Bạn có muốn lưu UID này không?`, {
+            bot.sendMessage(chatId, `❌ UID ${uid} đã DIE.\n⚠️ Die Dạng: ${result.dieType || 'Không rõ'}\n\n📌 Bạn có muốn lưu UID này không?`, {
                 reply_markup: {
                     inline_keyboard: [
-                        [{ text: '✅ Lưu UID', callback_data: `save_uid_${uid}` }, { text: '❌ Bỏ qua', callback_data: `ignore_uid` }]
+                        [{ text: '✅ Lưu UID', callback_data: `save_uid_${uid}` }, { text: '❌ Bỏ qua', callback_data: `ignore_uid` }],
+                        [{ text: '🔄 Check lại', callback_data: `recheck_${uid}` }]
                     ]
                 }
             });
         } else {
-            bot.sendMessage(chatId, `⚠️ Hệ thống kiểm tra đang lỗi hoặc Cookie cấu hình bị die.`);
+            bot.sendMessage(chatId, `⚠️ Hệ thống kiểm tra đang lỗi hoặc Cookie bị die.`);
             delete sessions[chatId];
         }
     } 
@@ -158,7 +180,7 @@ bot.on('message', async (msg) => {
             `INSERT OR REPLACE INTO accounts (uid, chat_id, name, created_at, last_check) VALUES (?, ?, ?, ?, ?)`,
             [uid, chatId, accName, new Date().toISOString(), new Date().toISOString()],
             (err) => {
-                if (!err) bot.sendMessage(chatId, `✅ Đã lưu UID: ${uid} (${accName}) vào danh sách theo dõi.`);
+                if (!err) bot.sendMessage(chatId, `✅ Đã lưu UID: ${uid} vào hệ thống.`);
                 delete sessions[chatId];
             }
         );
@@ -173,7 +195,7 @@ bot.on('callback_query', async (query) => {
     if (data.startsWith('save_uid_')) {
         const uid = data.replace('save_uid_', '');
         sessions[chatId] = { state: 'AWAITING_ACC_NAME', tempUid: uid };
-        bot.sendMessage(chatId, '📝 Vui lòng nhập Tên Tài Khoản hoặc Ghi chú cho UID này:', { reply_markup: { force_reply: true } });
+        bot.sendMessage(chatId, '📝 Vui lòng nhập Tên Tài Khoản/Ghi chú:', { reply_markup: { force_reply: true } });
         bot.answerCallbackQuery(query.id);
     } 
     else if (data === 'ignore_uid') {
@@ -187,7 +209,8 @@ bot.on('callback_query', async (query) => {
         bot.answerCallbackQuery(query.id, { text: '🛑 Đã dừng theo dõi' });
         bot.editMessageReplyMarkup({
             inline_keyboard: [
-                [{ text: '🔄 Tiếp tục theo dõi', callback_data: `resume_${uid}` }, { text: '❌ Xóa UID', callback_data: `delete_${uid}` }]
+                [{ text: '🔄 Tiếp tục theo dõi', callback_data: `resume_${uid}` }, { text: '🛑 Dừng theo dõi', callback_data: `pause_${uid}` }],
+                [{ text: '❌ Xóa UID', callback_data: `delete_${uid}` }]
             ]
         }, { chat_id: chatId, message_id: messageId });
     }
@@ -197,7 +220,7 @@ bot.on('callback_query', async (query) => {
         bot.answerCallbackQuery(query.id, { text: '▶️ Đã tiếp tục theo dõi' });
         bot.editMessageReplyMarkup({
             inline_keyboard: [
-                [{ text: '🔄 Check lại', callback_data: `recheck_${uid}` }, { text: '🛑 Dừng theo dõi', callback_data: `pause_${uid}` }],
+                [{ text: '🔄 Tiếp tục theo dõi', callback_data: `resume_${uid}` }, { text: '🛑 Dừng theo dõi', callback_data: `pause_${uid}` }],
                 [{ text: '❌ Xóa UID', callback_data: `delete_${uid}` }]
             ]
         }, { chat_id: chatId, message_id: messageId });
@@ -210,12 +233,13 @@ bot.on('callback_query', async (query) => {
     }
     else if (data.startsWith('recheck_')) {
         const uid = data.replace('recheck_', '');
-        bot.answerCallbackQuery(query.id, { text: '⏳ Đang kiểm tra...' });
+        bot.answerCallbackQuery(query.id, { text: '⏳ Đang check lại...' });
         const result = await smartCheck(uid);
-        bot.sendMessage(chatId, `Trạng thái hiện tại của UID ${uid}: ${result.status}`);
+        bot.sendMessage(chatId, `Trạng thái hiện tại: ${result.status}`);
     }
 });
 
+// ================= CRON JOB (AUTO MONITORING) =================
 cron.schedule('*/1 * * * *', async () => {
     db.all(`SELECT * FROM accounts WHERE is_tracking = 1`, async (err, rows) => {
         if (!rows || rows.length === 0) return;
@@ -227,7 +251,7 @@ cron.schedule('*/1 * * * *', async () => {
                 if (result.status === 'DIE' && row.status === 'LIVE') {
                     const failCount = row.fail_count + 1;
                     if (failCount >= 3) {
-                        const msgText = `🍂 ${row.uid} đã DIE ❌\n👤 Tài Khoản: ${row.name}\n📝 Ghi Chú: ${row.note}\n⚠️ Die Dạng: ${result.dieType}\n⏰ Thời Gian: ${formatTime()}`;
+                        const msgText = `🍂 ${row.uid} đã DIE ❌\n👤 Tài Khoản: ${row.name}\n📝 Ghi Chú: ${row.note}\n⏰ Thời Gian: ${formatTime()}`;
                         bot.sendMessage(row.chat_id, msgText, {
                             reply_markup: {
                                 inline_keyboard: [
@@ -243,8 +267,15 @@ cron.schedule('*/1 * * * *', async () => {
                     }
                 } 
                 else if (result.status === 'LIVE' && row.status === 'DIE') {
-                    const msgText = `🌱 ${row.uid} ĐÃ SỐNG LẠI (LIVE) ✅\n👤 Tài Khoản: ${row.name}\n⏰ Thời Gian: ${formatTime()}`;
-                    bot.sendMessage(row.chat_id, msgText, { reply_markup: { inline_keyboard: [[{ text: '❌ Xóa UID', callback_data: `delete_${row.uid}` }]] } });
+                    const msgText = `✅ THÔNG BÁO: UID ĐÃ SỐNG LẠI!\n\n🆔 UID: ${row.uid}\n🟢 Trạng thái: LIVE\n⏰ Báo cáo lúc: ${formatTime()}`;
+                    bot.sendMessage(row.chat_id, msgText, {
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{ text: '🔄 Tiếp tục theo dõi', callback_data: `resume_${row.uid}` }, { text: '🛑 Dừng theo dõi', callback_data: `pause_${row.uid}` }],
+                                [{ text: '❌ Xóa UID', callback_data: `delete_${row.uid}` }]
+                            ]
+                        }
+                    });
                     db.run(`UPDATE accounts SET status='LIVE', fail_count=0, die_type='', live_back_time=?, last_check=? WHERE uid=?`, 
                         [new Date().toISOString(), new Date().toISOString(), row.uid]);
                 } 
@@ -257,7 +288,6 @@ cron.schedule('*/1 * * * *', async () => {
 });
 
 // ================= RENDER WEB SERVER =================
-// Web Server ảo để Render không báo lỗi "Port bind timeout"
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -266,6 +296,6 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`🌍 Web Server đang chạy trên port ${PORT} (Pass Render Health Check)`);
-    console.log('🚀 SYSTEM READY: Tối ưu chuẩn PRO 98%');
+    console.log(`🌍 Web Server đang chạy trên port ${PORT}`);
+    console.log('🚀 SYSTEM READY');
 });
