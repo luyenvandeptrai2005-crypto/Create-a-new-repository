@@ -5,7 +5,7 @@ const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
 const cron = require('node-cron');
 const PQueue = require('p-queue').default;
-const express = require('express'); // THÊM EXPRESS CHO RENDER
+const express = require('express');
 
 // ================= CONFIG & INIT =================
 const CONFIG = {
@@ -16,7 +16,7 @@ const CONFIG = {
 };
 
 if (!CONFIG.BOT_TOKEN) {
-    console.error('❌ THIẾU TELEGRAM_BOT_TOKEN trong .env');
+    console.error('❌ THIẾU TELEGRAM_BOT_TOKEN trong .env hoặc biến môi trường');
     process.exit(1);
 }
 
@@ -268,6 +268,4 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
     console.log(`🌍 Web Server đang chạy trên port ${PORT} (Pass Render Health Check)`);
     console.log('🚀 SYSTEM READY: Tối ưu chuẩn PRO 98%');
-});const app = express();
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { ... });
+});
