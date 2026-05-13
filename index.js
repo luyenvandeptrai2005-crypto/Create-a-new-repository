@@ -23,7 +23,9 @@ if (!CONFIG.BOT_TOKEN) {
 const bot = new TelegramBot(CONFIG.BOT_TOKEN, { polling: true });
 const db = new sqlite3.Database('./uid_pro_monitor.db');
 const queue = new PQueue({ interval: CONFIG.CHECK_INTERVAL, intervalCap: 1 });
-const sessions = {}; 
+
+// Quản lý trạng thái đàm thoại (State)
+const userSessions = new Map();
 
 const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -39,6 +41,7 @@ db.serialize(() => {
             name TEXT DEFAULT 'chưa cập nhật',
             note TEXT DEFAULT '🦦',
             status TEXT DEFAULT 'LIVE',
+            die_type TEXT DEFAULT 'Không rõ',
             is_tracking INTEGER DEFAULT 1,
             fail_count INTEGER DEFAULT 0,
             created_at TEXT
@@ -48,16 +51,41 @@ db.serialize(() => {
 
 // ================= HELPER FUNCTIONS =================
 const getRandomUA = () => USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+
 const formatTime = () => {
     const d = new Date();
-    return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')} ${d.getDate().toString().padStart(2, '0')}/${(d.getMonth() + 1).toString().padStart(2, '0')}/${d.getFullYear()}`;
+    const pad = (n) => n.toString().padStart(2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())} ${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`;
 };
+
 const extractUID = (input) => {
+    if (!input) return null;
     const match = input.trim().match(/(\d{5,20})/);
     return match ? match[1] : null;
 };
 
-// ================= SMART CHECK (ĐÃ FIX LỖI NGƯỢC LOGIC) =================
+// Hàm bắt dạng DIE từ URL redirect
+const detectDieType = (url, html) => {
+    if (!url) return 'Không rõ';
+    const checkpointMatch = url.match(/checkpoint\/(\d+)/);
+    if (checkpointMatch) {
+        const id = checkpointMatch[1];
+        if (id.endsWith('282')) return '282';
+        if (id.endsWith('956')) return '956';
+        return id; 
+    }
+    const helpMatch = url.match(/help\/(?:contact\/)?(\d+)/);
+    if (helpMatch) {
+        const id = helpMatch[1];
+        if (id.endsWith('583')) return '583';
+        return id;
+    }
+    if (url.includes('/recover/')) return 'Recover';
+    if (url.includes('/login/') && html.includes('tài khoản của bạn đã bị vô hiệu hóa')) return 'Disabled';
+    return 'Không rõ';
+};
+
+// ================= CORE CHECKER =================
 async function smartCheck(uid) {
     try {
         const res = await axios.get(`https://mbasic.facebook.com/${uid}`, {
@@ -74,91 +102,77 @@ async function smartCheck(uid) {
         const location = res.headers.location || '';
         const html = String(res.data).toLowerCase();
 
-        // 1. Chặn lỗi Cookie Die (Tránh việc nhận nhầm trang Login thành LIVE)
-        if (location.includes('login.php')) {
+        // 1. Kiểm tra Cookie lỗi
+        if (location.includes('login.php') && !html.includes('profile')) {
             return { status: 'COOKIE_DIE' };
         }
 
-        // 2. Chặn lỗi Checkpoint / Khóa
+        // 2. Kiểm tra Redirect dính Checkpoint / Help Center
         if (location.includes('checkpoint') || location.includes('recover') || location.includes('help')) {
-            return { status: 'DIE' };
+            const dieType = detectDieType(location, html);
+            return { status: 'DIE', dieType };
         }
 
-        // 3. Quét từ khóa DIE thật sự
-        const dieKeywords = ["this content isn't available", "nội dung này hiện không khả dụng", "không tìm thấy nội dung"];
+        // 3. Quét từ khóa DIE nội dung không khả dụng
+        const dieKeywords = ["this content isn't available", "nội dung này hiện không khả dụng", "không tìm thấy nội dung", "liên kết bạn đã theo dõi có thể bị hỏng"];
         if (dieKeywords.some(v => html.includes(v)) || res.status === 404) {
-            return { status: 'DIE' };
+            return { status: 'DIE', dieType: 'Mất liên kết / 404' };
         }
 
-        // 4. Quét từ khóa xác nhận LIVE (Phải có nút thêm bạn, nhắn tin hoặc dòng thời gian thì mới là LIVE thật)
-        const liveKeywords = ['timeline', 'dòng thời gian', 'add friend', 'thêm bạn', 'nhắn tin', 'message'];
-        if (liveKeywords.some(v => html.includes(v))) {
+        // 4. Xác nhận LIVE thật sự
+        const liveKeywords = ['timeline', 'dòng thời gian', 'add friend', 'thêm bạn', 'nhắn tin', 'message', 'photo'];
+        if (liveKeywords.some(v => html.includes(v)) || html.includes(uid)) {
             return { status: 'LIVE' };
         }
 
-        return { status: 'ERROR' };
+        return { status: 'DIE', dieType: 'Không xác định' };
     } catch (e) {
         return { status: 'ERROR' };
     }
 }
 
-// ================= GIAO DIỆN & MENU (CHUẨN ẢNH) =================
-const showMainMenu = (chatId) => {
-    bot.sendMessage(chatId, `⚙️ *HỆ THỐNG QUẢN LÝ TÀI KHOẢN PRO*\nChọn chức năng bên dưới để bắt đầu:`, {
+// ================= BOT COMMANDS & INTERFACE =================
+bot.setMyCommands([
+    { command: '/start', description: 'Mở Menu hệ thống' },
+    { command: '/check', description: 'Vui lòng nhập UID Hoặc URL' }
+]);
+
+bot.onText(/\/start/, (msg) => {
+    userSessions.delete(msg.chat.id);
+    bot.sendMessage(msg.chat.id, `⚙️ *HỆ THỐNG QUẢN LÝ TÀI KHOẢN PRO*\nChọn chức năng bên dưới để bắt đầu:`, {
         parse_mode: 'Markdown',
         reply_markup: {
             inline_keyboard: [
-                [{ text: '🔍 Check UID Mới', callback_data: 'menu_check' }],
-                [{ text: '📋 Danh sách theo dõi', callback_data: 'menu_list' }],
-                [{ text: '🆘 Trợ giúp', callback_data: 'menu_help' }]
+                [{ text: '🔍 Check UID Mới', callback_data: 'menu_check' }]
             ]
         }
     });
-};
+});
 
-bot.onText(/\/start/, (msg) => showMainMenu(msg.chat.id));
+bot.onText(/\/check/, (msg) => {
+    userSessions.set(msg.chat.id, { state: 'AWAITING_UID' });
+    bot.sendMessage(msg.chat.id, '📬 Vui lòng nhập UID Hoặc URL:');
+});
 
+// ================= CALLBACK QUERIES =================
 bot.on('callback_query', async (query) => {
     const data = query.data;
     const chatId = query.message.chat.id;
     const messageId = query.message.message_id;
 
-    // --- Xử lý Menu ---
     if (data === 'menu_check') {
-        sessions[chatId] = { state: 'AWAITING_UID' };
-        bot.sendMessage(chatId, '📬 Vui lòng nhập UID Hoặc URL muốn kiểm tra:', { reply_markup: { force_reply: true } });
+        userSessions.set(chatId, { state: 'AWAITING_UID' });
+        bot.sendMessage(chatId, '📬 Vui lòng nhập UID Hoặc URL:');
         bot.answerCallbackQuery(query.id);
     } 
-    else if (data === 'menu_list') {
-        db.all(`SELECT * FROM accounts`, (err, rows) => {
-            if (!rows || rows.length === 0) {
-                bot.sendMessage(chatId, '📭 Danh sách trống.');
-            } else {
-                let text = '📋 *DANH SÁCH UID ĐANG THEO DÕI*\n\n';
-                rows.forEach(r => {
-                    const status = r.status === 'LIVE' ? '🟢 LIVE' : '🔴 DIE';
-                    const tracking = r.is_tracking ? '' : '(Đang dừng)';
-                    text += `• \`${r.uid}\` | ${r.name} | ${status} ${tracking}\n`;
-                });
-                bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
-            }
-        });
-        bot.answerCallbackQuery(query.id);
-    }
-    else if (data === 'menu_help') {
-        bot.sendMessage(chatId, 'Bot theo dõi UID tự động chuẩn 98%. Để sử dụng, vui lòng chọn Check UID mới và làm theo hướng dẫn.');
-        bot.answerCallbackQuery(query.id);
-    }
-
-    // --- Xử lý Nút Bấm UID ---
     else if (data.startsWith('save_uid_')) {
         const uid = data.replace('save_uid_', '');
-        sessions[chatId] = { state: 'AWAITING_ACC_NAME', tempUid: uid };
-        bot.sendMessage(chatId, '📝 Vui lòng nhập Tài Khoản/Ghi chú cho UID này:', { reply_markup: { force_reply: true } });
+        userSessions.set(chatId, { state: 'AWAITING_ACC_NAME', tempUid: uid });
+        bot.sendMessage(chatId, '📝 Vui lòng nhập Tên Tài Khoản cho UID này:', { reply_markup: { force_reply: true } });
         bot.answerCallbackQuery(query.id);
     } 
     else if (data === 'ignore_uid') {
-        delete sessions[chatId];
+        userSessions.delete(chatId);
         bot.deleteMessage(chatId, messageId);
         bot.answerCallbackQuery(query.id, { text: 'Đã bỏ qua.' });
     }
@@ -166,9 +180,12 @@ bot.on('callback_query', async (query) => {
         const uid = data.replace('pause_', '');
         db.run(`UPDATE accounts SET is_tracking = 0 WHERE uid = ?`, [uid]);
         bot.answerCallbackQuery(query.id, { text: '🛑 Đã dừng theo dõi' });
+        
+        // Đổi nút thành Tiếp tục theo dõi giống ảnh mẫu
         bot.editMessageReplyMarkup({
             inline_keyboard: [
-                [{ text: '🔄 Tiếp tục theo dõi', callback_data: `resume_${uid}` }, { text: '❌ Xóa UID', callback_data: `delete_${uid}` }]
+                [{ text: '🔄 Tiếp tục theo dõi', callback_data: `resume_${uid}` }, { text: '🛑 Dừng theo dõi', callback_data: `pause_${uid}` }],
+                [{ text: '❌ Xóa UID', callback_data: `delete_${uid}` }]
             ]
         }, { chat_id: chatId, message_id: messageId });
     }
@@ -176,9 +193,11 @@ bot.on('callback_query', async (query) => {
         const uid = data.replace('resume_', '');
         db.run(`UPDATE accounts SET is_tracking = 1 WHERE uid = ?`, [uid]);
         bot.answerCallbackQuery(query.id, { text: '▶️ Đã tiếp tục theo dõi' });
+        
         bot.editMessageReplyMarkup({
             inline_keyboard: [
-                [{ text: '🛑 Dừng theo dõi', callback_data: `pause_${uid}` }, { text: '❌ Xóa UID', callback_data: `delete_${uid}` }]
+                [{ text: '🔄 Tiếp tục theo dõi', callback_data: `resume_${uid}` }, { text: '🛑 Dừng theo dõi', callback_data: `pause_${uid}` }],
+                [{ text: '❌ Xóa UID', callback_data: `delete_${uid}` }]
             ]
         }, { chat_id: chatId, message_id: messageId });
     }
@@ -188,13 +207,24 @@ bot.on('callback_query', async (query) => {
         bot.answerCallbackQuery(query.id, { text: `🗑 Đã xóa UID ${uid}` });
         bot.deleteMessage(chatId, messageId);
     }
+    else if (data.startsWith('recheck_')) {
+        const uid = data.replace('recheck_', '');
+        bot.answerCallbackQuery(query.id, { text: '⏳ Đang kiểm tra lại...' });
+        
+        const result = await smartCheck(uid);
+        if (result.status === 'LIVE') {
+            bot.sendMessage(chatId, `✅ UID của bạn là: \`${uid}\` đang LIVE.`);
+        } else {
+            bot.sendMessage(chatId, `❌ UID \`${uid}\` đã DIE.\n⚠️ Die Dạng: ${result.dieType || 'Không rõ'}`);
+        }
+    }
 });
 
-// ================= XỬ LÝ TIN NHẮN TEXT =================
+// ================= TEXT MESSAGES HANDLER =================
 bot.on('message', async (msg) => {
     if (!msg.text || msg.text.startsWith('/')) return;
     const chatId = msg.chat.id;
-    const session = sessions[chatId];
+    const session = userSessions.get(chatId);
 
     if (session && session.state === 'AWAITING_UID') {
         const uid = extractUID(msg.text);
@@ -203,25 +233,27 @@ bot.on('message', async (msg) => {
         const result = await smartCheck(uid);
 
         if (result.status === 'LIVE') {
-            bot.sendMessage(chatId, `✅ UID của bạn là: ${uid} đang LIVE.\n\n📌 Bạn có muốn lưu UID này không?`, {
+            bot.sendMessage(chatId, `✅ UID của bạn là: \`${uid}\``);
+            userSessions.delete(chatId);
+        } 
+        else if (result.status === 'DIE') {
+            // Khớp 100% Giao diện check tay trong ảnh mẫu của bạn
+            const textDie = `❌ UID \`${uid}\` đã DIE.\n⚠️ Die Dạng: ${result.dieType}\n\n📌 Bạn có muốn lưu UID này không?`;
+            bot.sendMessage(chatId, textDie, {
+                parse_mode: 'Markdown',
                 reply_markup: {
                     inline_keyboard: [
-                        [{ text: '✅ Lưu UID', callback_data: `save_uid_${uid}` }, { text: '❌ Bỏ qua', callback_data: `ignore_uid` }]
+                        [{ text: '✅ Lưu UID', callback_data: `save_uid_${uid}` }, { text: '❌ Bỏ qua', callback_data: `ignore_uid` }],
+                        [{ text: '🔄 Check lại', callback_data: `recheck_${uid}` }]
                     ]
                 }
             });
-        } else if (result.status === 'DIE') {
-            bot.sendMessage(chatId, `❌ UID của bạn là: ${uid} đã DIE.\n\n📌 Bạn có muốn lưu UID này không?`, {
-                reply_markup: {
-                    inline_keyboard: [
-                        [{ text: '✅ Lưu UID', callback_data: `save_uid_${uid}` }, { text: '❌ Bỏ qua', callback_data: `ignore_uid` }]
-                    ]
-                }
-            });
-        } else if (result.status === 'COOKIE_DIE') {
-            bot.sendMessage(chatId, `⚠️ Hệ thống báo lỗi Cookie! Vui lòng cập nhật lại FB_COOKIE.`);
+            userSessions.delete(chatId);
+        } 
+        else if (result.status === 'COOKIE_DIE') {
+            bot.sendMessage(chatId, `⚠️ COOKIE FACEBOOK ĐÃ DIE`);
+            userSessions.delete(chatId);
         }
-        delete sessions[chatId];
     } 
     else if (session && session.state === 'AWAITING_ACC_NAME') {
         const uid = session.tempUid;
@@ -231,14 +263,14 @@ bot.on('message', async (msg) => {
             `INSERT OR REPLACE INTO accounts (uid, chat_id, name, created_at) VALUES (?, ?, ?, ?)`,
             [uid, chatId, accName, new Date().toISOString()],
             (err) => {
-                if (!err) bot.sendMessage(chatId, `✅ Đã lưu UID: ${uid} vào danh sách.`);
-                delete sessions[chatId];
+                if (!err) bot.sendMessage(chatId, `✅ Đã thêm UID thành công.`);
+                userSessions.delete(chatId);
             }
         );
     }
 });
 
-// ================= AUTO CRON JOB =================
+// ================= AUTO MONITORING (CRON JOB) =================
 cron.schedule('*/1 * * * *', async () => {
     db.all(`SELECT * FROM accounts WHERE is_tracking = 1`, async (err, rows) => {
         if (!rows || rows.length === 0) return;
@@ -247,11 +279,14 @@ cron.schedule('*/1 * * * *', async () => {
                 const result = await smartCheck(row.uid);
                 if (result.status === 'ERROR' || result.status === 'COOKIE_DIE') return; 
 
+                // Khớp Giao diện cảnh báo tự động chạy ngầm trong ảnh mẫu của bạn
                 if (result.status === 'DIE' && row.status === 'LIVE') {
                     const failCount = row.fail_count + 1;
                     if (failCount >= 3) {
-                        const msgText = `🍂 ${row.uid} đã DIE ❌\n👤 Tài Khoản: ${row.name}\n📝 Ghi Chú: ${row.note}\n⏰ Thời Gian: ${formatTime()}`;
+                        const msgText = `🍂 \`${row.uid}\` đã DIE ❌\n👤 Tài Khoản: ${row.name}\n📝 Ghi Chú: ${row.note}\n⏰ Thời Gian: ${formatTime()}`;
+                        
                         bot.sendMessage(row.chat_id, msgText, {
+                            parse_mode: 'Markdown',
                             reply_markup: {
                                 inline_keyboard: [
                                     [{ text: '🔄 Tiếp tục theo dõi', callback_data: `resume_${row.uid}` }, { text: '🛑 Dừng theo dõi', callback_data: `pause_${row.uid}` }],
@@ -259,21 +294,24 @@ cron.schedule('*/1 * * * *', async () => {
                                 ]
                             }
                         });
-                        db.run(`UPDATE accounts SET status='DIE', fail_count=0 WHERE uid=?`, [row.uid]);
+                        db.run(`UPDATE accounts SET status='DIE', die_type=?, fail_count=0 WHERE uid=?`, [result.dieType, row.uid]);
                     } else {
                         db.run(`UPDATE accounts SET fail_count=? WHERE uid=?`, [failCount, row.uid]);
                     }
                 } 
                 else if (result.status === 'LIVE' && row.status === 'DIE') {
-                    const msgText = `✅ THÔNG BÁO: UID ĐÃ SỐNG LẠI!\n\n🆔 UID: ${row.uid}\n🟢 Trạng thái: LIVE\n⏰ Báo cáo lúc: ${formatTime()}`;
+                    const msgText = `🟢 *THÔNG BÁO: UID ĐÃ SỐNG LẠI*\n\n🆔 UID: \`${row.uid}\`\n👤 Tài Khoản: ${row.name}\n🌿 Trạng thái: LIVE\n⏰ Báo cáo lúc: ${formatTime()}`;
+                    
                     bot.sendMessage(row.chat_id, msgText, {
+                        parse_mode: 'Markdown',
                         reply_markup: {
                             inline_keyboard: [
-                                [{ text: '🛑 Dừng theo dõi', callback_data: `pause_${row.uid}` }, { text: '❌ Xóa UID', callback_data: `delete_${row.uid}` }]
+                                [{ text: '🔄 Tiếp tục theo dõi', callback_data: `resume_${row.uid}` }, { text: '🛑 Dừng theo dõi', callback_data: `pause_${row.uid}` }],
+                                [{ text: '❌ Xóa UID', callback_data: `delete_${row.uid}` }]
                             ]
                         }
                     });
-                    db.run(`UPDATE accounts SET status='LIVE', fail_count=0 WHERE uid=?`, [row.uid]);
+                    db.run(`UPDATE accounts SET status='LIVE', fail_count=0, die_type='Không rõ' WHERE uid=?`, [row.uid]);
                 } 
                 else if (result.status === 'LIVE') {
                     db.run(`UPDATE accounts SET fail_count=0 WHERE uid=?`, [row.uid]);
@@ -283,8 +321,8 @@ cron.schedule('*/1 * * * *', async () => {
     });
 });
 
-// ================= WEB SERVER (RENDER) =================
+// ================= RENDER WEB SERVER =================
 const app = express();
 const PORT = process.env.PORT || 3000;
-app.get('/', (req, res) => res.send('🟢 Bot Telegram Monitor UID đang hoạt động!'));
+app.get('/', (req, res) => res.send('🟢 System Online'));
 app.listen(PORT, () => console.log(`🚀 SYSTEM READY trên port ${PORT}`));
