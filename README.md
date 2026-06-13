@@ -1,2 +1,2 @@
-# Create-a-new-repository
-Telegram Facebook UID Monitor Bot
+node_modules/
+.env
