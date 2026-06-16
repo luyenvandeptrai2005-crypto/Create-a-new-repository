@@ -1,5 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
+const http = require('http'); // Tích hợp thêm HTTP để Render không bị lỗi Port Scan
 
 // Khởi tạo bot với token từ biến môi trường
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, { polling: true });
@@ -7,35 +8,43 @@ const DB_FILE = 'users.json'; // File giả lập database lưu danh sách ngư�
 
 // ==========================================
 // CẤU HÌNH SỐ LƯỢNG NGƯỜI DÙNG ẢO
-// Hiện tại bạn có 7 người thật, cộng thêm 3462 sẽ hiển thị thành 3469
-const FAKE_USER_OFFSET = 3462; 
+// Hiện tại bạn có 7 người thật, cộng thêm 3273 sẽ hiển thị thành 3280
+const FAKE_USER_OFFSET = 3273; 
 // ==========================================
 
 // Hàm tải danh sách người dùng thật từ file
 function getUsers() {
     if (!fs.existsSync(DB_FILE)) return [];
-    return JSON.parse(fs.readFileSync(DB_FILE));
+    try {
+        const data = fs.readFileSync(DB_FILE, 'utf8');
+        return data ? JSON.parse(data) : [];
+    } catch (err) {
+        console.error("Lỗi khi đọc file database:", err.message);
+        return [];
+    }
 }
 
 // Lệnh 1: Lưu người dùng khi họ nhấn /start
 bot.onText(/\/start/, (msg) => {
     let users = getUsers();
-    if (!users.includes(msg.chat.id)) {
-        users.push(msg.chat.id);
-        fs.writeFileSync(DB_FILE, JSON.stringify(users));
+    const chatId = msg.chat.id;
+
+    if (!users.includes(chatId)) {
+        users.push(chatId);
+        fs.writeFileSync(DB_FILE, JSON.stringify(users, null, 2));
     }
-    bot.sendMessage(msg.chat.id, "Chào mừng bạn đến với CheckUIDPro! Bot đã lưu thông tin của bạn.");
+    bot.sendMessage(chatId, "Chào mừng bạn đến với CheckUIDPro! Bot đã lưu thông tin của bạn.");
 });
 
-// Lệnh 2: Xem thống kê số lượng người dùng (Đã cộng số ảo)
+// Lệnh 2: Xem thống kê số lượng người dùng (Đã đổi thành Người dùng hàng tháng)
 bot.onText(/\/thongke/, (msg) => {
     let realUsers = getUsers().length;
     let totalVirtualUsers = realUsers + FAKE_USER_OFFSET;
     
     const thongKeMsg = `📊 <b>THỐNG KÊ HỆ THỐNG CHECKUIDPRO</b>\n\n` +
-                       `👥 Tổng số người dùng: <b>${totalVirtualUsers.toLocaleString('vi-VN')}</b> người\n` +
+                       `👥 Người dùng hàng tháng (MAU): <b>${totalVirtualUsers.toLocaleString('vi-VN')}</b> người\n` +
                        `🟢 Trạng thái: Hoạt động bình thường\n` +
-                       `⏰ Cập nhật lúc: ${new Date().toLocaleTimeString()} - ${new Date().toLocaleDateString()}`;
+                       `⏰ Cập nhật lúc: ${new Date().toLocaleTimeString('vi-VN')} - ${new Date().toLocaleDateString('vi-VN')}`;
                        
     bot.sendMessage(msg.chat.id, thongKeMsg, { parse_mode: 'HTML' });
 });
@@ -54,7 +63,7 @@ bot.onText(/\/thongbao (.+)/, async (msg, match) => {
                      `===========================\n\n` +
                      `${noiDung}\n\n` +
                      `===========================\n` +
-                     `⏰ ${new Date().toLocaleTimeString()} - ${new Date().toLocaleDateString()}`;
+                     `⏰ ${new Date().toLocaleTimeString('vi-VN')} - ${new Date().toLocaleDateString('vi-VN')}`;
 
     // Tính toán số liệu ảo
     const totalVirtualUsers = users.length + FAKE_USER_OFFSET;
@@ -70,7 +79,7 @@ bot.onText(/\/thongbao (.+)/, async (msg, match) => {
             await bot.sendMessage(userId, thongBao, { parse_mode: 'HTML' });
             realSuccessCount++;
             
-            // Tạm dừng 50ms giữa mỗi tin nhắn để tránh bị Telegram đánh dấu là spam API (Tùy chọn, khuyến khích dùng)
+            // Tạm dừng 50ms giữa mỗi tin nhắn để tránh bị Telegram đánh dấu là spam API
             await new Promise(resolve => setTimeout(resolve, 50));
         } catch (err) {
             console.log(`[LỖI] Không gửi được cho ${userId}: ${err.message}`);
@@ -86,5 +95,16 @@ bot.onText(/\/thongbao (.+)/, async (msg, match) => {
     bot.sendMessage(msg.chat.id, reportMsg, { parse_mode: 'HTML' });
 });
 
-// Báo hiệu bot đã khởi động thành công trên Terminal/Console
-console.log("🤖 Bot CheckUIDPro đang chạy... Nhấn Ctrl+C để dừng.");
+// ==========================================
+// CẤU HÌNH WEB SERVER MINI CHO RENDER
+// Render yêu cầu hệ thống phải lắng nghe một Port nếu chạy dạng Web Service công khai.
+const PORT = process.env.PORT || 3000;
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Bot CheckUIDPro đang hoạt động ổn định 24/7!');
+});
+
+server.listen(PORT, () => {
+    console.log(`🌐 Web Server chạy tại port: ${PORT}`);
+    console.log("🤖 Bot CheckUIDPro đang online... Sẵn sàng nhận lệnh!");
+});
